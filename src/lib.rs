@@ -22,6 +22,12 @@ pub enum Error {
     #[error("provider call failed: {0}")]
     ProviderCall(String),
 
+    #[error("secret source is unsupported: {0}")]
+    SecretSourceUnsupported(String),
+
+    #[error("secret source is unavailable: {0}")]
+    SecretSourceUnavailable(String),
+
     #[cfg(feature = "live-provider")]
     #[error("provider endpoint returned malformed response: {0}")]
     ProviderResponse(String),
@@ -116,8 +122,7 @@ impl fmt::Debug for SecretSourceReference {
 #[derive(Clone, PartialEq, Eq)]
 pub enum ProviderAuthorization {
     NoSecret,
-    SecretSource(SecretSourceReference),
-    BearerSecret(String),
+    BearerSecretSource(SecretSourceReference),
 }
 
 impl ProviderAuthorization {
@@ -125,22 +130,19 @@ impl ProviderAuthorization {
         Self::NoSecret
     }
 
-    pub fn secret_source(reference: SecretSourceReference) -> Self {
-        Self::SecretSource(reference)
+    pub fn bearer_secret_source(reference: SecretSourceReference) -> Self {
+        Self::BearerSecretSource(reference)
     }
 
-    pub fn bearer_secret(secret: impl Into<String>) -> Result<Self, Error> {
-        let secret = secret.into();
-        if secret.is_empty() {
-            return Err(Error::EmptyValue);
-        }
-        Ok(Self::BearerSecret(secret))
-    }
-
-    pub fn bearer_secret_value(&self) -> Option<&str> {
+    pub fn resolve(
+        &self,
+        resolver: &dyn ProviderSecretResolver,
+    ) -> Result<ResolvedProviderAuthorization, Error> {
         match self {
-            Self::BearerSecret(secret) => Some(secret.as_str()),
-            _ => None,
+            Self::NoSecret => Ok(ResolvedProviderAuthorization::NoSecret),
+            Self::BearerSecretSource(reference) => resolver
+                .resolve(reference)
+                .map(ResolvedProviderAuthorization::BearerSecret),
         }
     }
 }
@@ -149,12 +151,89 @@ impl fmt::Debug for ProviderAuthorization {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::NoSecret => formatter.write_str("NoSecret"),
-            Self::SecretSource(reference) => formatter
-                .debug_tuple("SecretSource")
+            Self::BearerSecretSource(reference) => formatter
+                .debug_tuple("BearerSecretSource")
                 .field(reference)
                 .finish(),
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct TransientBearerSecret(String);
+
+impl TransientBearerSecret {
+    pub fn new(value: impl Into<String>) -> Result<Self, Error> {
+        let value = value.into();
+        if value.is_empty() {
+            return Err(Error::EmptyValue);
+        }
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+impl fmt::Debug for TransientBearerSecret {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("TransientBearerSecret(<redacted>)")
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub enum ResolvedProviderAuthorization {
+    NoSecret,
+    BearerSecret(TransientBearerSecret),
+}
+
+impl ResolvedProviderAuthorization {
+    pub fn no_secret() -> Self {
+        Self::NoSecret
+    }
+
+    pub fn bearer_secret(secret: TransientBearerSecret) -> Self {
+        Self::BearerSecret(secret)
+    }
+
+    pub fn bearer_secret_value(&self) -> Option<&str> {
+        match self {
+            Self::BearerSecret(secret) => Some(secret.as_str()),
+            Self::NoSecret => None,
+        }
+    }
+}
+
+impl fmt::Debug for ResolvedProviderAuthorization {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NoSecret => formatter.write_str("NoSecret"),
             Self::BearerSecret(_) => formatter.write_str("BearerSecret(<redacted>)"),
         }
+    }
+}
+
+pub trait ProviderSecretResolver: Send + Sync {
+    fn resolve(&self, reference: &SecretSourceReference) -> Result<TransientBearerSecret, Error>;
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EnvironmentSecretResolver;
+
+impl ProviderSecretResolver for EnvironmentSecretResolver {
+    fn resolve(&self, reference: &SecretSourceReference) -> Result<TransientBearerSecret, Error> {
+        let Some(name) = reference.as_str().strip_prefix("env:") else {
+            return Err(Error::SecretSourceUnsupported(
+                reference.as_str().to_owned(),
+            ));
+        };
+        if name.is_empty() {
+            return Err(Error::EmptyValue);
+        }
+        std::env::var(name)
+            .map_err(|_| Error::SecretSourceUnavailable(reference.as_str().to_owned()))
+            .and_then(TransientBearerSecret::new)
     }
 }
 
@@ -204,7 +283,7 @@ pub enum ProviderMessageRole {
 pub struct ProviderCallRequest {
     provider_name: ProviderName,
     model_name: ProviderModelName,
-    authorization: ProviderAuthorization,
+    authorization: ResolvedProviderAuthorization,
     messages: Vec<ProviderMessage>,
 }
 
@@ -212,7 +291,7 @@ impl ProviderCallRequest {
     pub fn new(
         provider_name: ProviderName,
         model_name: ProviderModelName,
-        authorization: ProviderAuthorization,
+        authorization: ResolvedProviderAuthorization,
         messages: Vec<ProviderMessage>,
     ) -> Self {
         Self {
@@ -231,7 +310,7 @@ impl ProviderCallRequest {
         &self.model_name
     }
 
-    pub fn authorization(&self) -> &ProviderAuthorization {
+    pub fn authorization(&self) -> &ResolvedProviderAuthorization {
         &self.authorization
     }
 
@@ -265,6 +344,15 @@ impl ProviderCallReply {
 
 pub trait ProviderClient: Send + Sync {
     fn call(&self, request: ProviderCallRequest) -> Result<ProviderCallReply, Error>;
+}
+
+impl<Client> ProviderClient for Box<Client>
+where
+    Client: ProviderClient + ?Sized,
+{
+    fn call(&self, request: ProviderCallRequest) -> Result<ProviderCallReply, Error> {
+        self.as_ref().call(request)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -472,10 +560,17 @@ mod tests {
 
     #[test]
     fn secret_debug_is_redacted() {
-        let authorization = ProviderAuthorization::bearer_secret("secret").unwrap();
         let reference = SecretSourceReference::unchecked("env:API_KEY");
+        let authorization = ProviderAuthorization::bearer_secret_source(reference.clone());
+        let resolved = ResolvedProviderAuthorization::bearer_secret(
+            TransientBearerSecret::new("secret").unwrap(),
+        );
 
-        assert_eq!(format!("{authorization:?}"), "BearerSecret(<redacted>)");
+        assert_eq!(
+            format!("{authorization:?}"),
+            "BearerSecretSource(SecretSourceReference(<redacted>))"
+        );
+        assert_eq!(format!("{resolved:?}"), "BearerSecret(<redacted>)");
         assert_eq!(
             format!("{reference:?}"),
             "SecretSourceReference(<redacted>)"
@@ -488,7 +583,7 @@ mod tests {
         let request = ProviderCallRequest::new(
             ProviderName::unchecked("fixture"),
             ProviderModelName::unchecked("fixture"),
-            ProviderAuthorization::no_secret(),
+            ResolvedProviderAuthorization::no_secret(),
             vec![ProviderMessage::user("judge this")],
         );
 
