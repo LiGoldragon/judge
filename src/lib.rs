@@ -6,8 +6,11 @@
 
 #![forbid(unsafe_code)]
 
+use std::ffi::OsString;
 use std::fmt;
 use std::num::NonZeroUsize;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use thiserror::Error;
 
@@ -27,6 +30,9 @@ pub enum Error {
 
     #[error("secret source is unavailable: {0}")]
     SecretSourceUnavailable(String),
+
+    #[error("provider command failed: {0}")]
+    ProviderCommand(String),
 
     #[cfg(feature = "live-provider")]
     #[error("provider endpoint returned malformed response: {0}")]
@@ -92,6 +98,23 @@ impl ProviderModelName {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReasoningEffort {
+    Low,
+    Medium,
+    High,
+}
+
+impl ReasoningEffort {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+        }
+    }
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub struct SecretSourceReference(String);
 
@@ -120,9 +143,33 @@ impl fmt::Debug for SecretSourceReference {
 }
 
 #[derive(Clone, PartialEq, Eq)]
+pub struct SessionAuthorizationSourceReference(String);
+
+impl SessionAuthorizationSourceReference {
+    pub fn new(value: impl Into<String>) -> Result<Self, Error> {
+        let value = value.into();
+        if value.is_empty() {
+            return Err(Error::EmptyValue);
+        }
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+impl fmt::Debug for SessionAuthorizationSourceReference {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SessionAuthorizationSourceReference(<redacted>)")
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
 pub enum ProviderAuthorization {
     NoSecret,
     BearerSecretSource(SecretSourceReference),
+    ExternalSession(SessionAuthorizationSourceReference),
 }
 
 impl ProviderAuthorization {
@@ -134,6 +181,10 @@ impl ProviderAuthorization {
         Self::BearerSecretSource(reference)
     }
 
+    pub fn external_session(reference: SessionAuthorizationSourceReference) -> Self {
+        Self::ExternalSession(reference)
+    }
+
     pub fn resolve(
         &self,
         resolver: &dyn ProviderSecretResolver,
@@ -143,6 +194,9 @@ impl ProviderAuthorization {
             Self::BearerSecretSource(reference) => resolver
                 .resolve(reference)
                 .map(ResolvedProviderAuthorization::BearerSecret),
+            Self::ExternalSession(reference) => Ok(ResolvedProviderAuthorization::ExternalSession(
+                reference.clone(),
+            )),
         }
     }
 }
@@ -153,6 +207,10 @@ impl fmt::Debug for ProviderAuthorization {
             Self::NoSecret => formatter.write_str("NoSecret"),
             Self::BearerSecretSource(reference) => formatter
                 .debug_tuple("BearerSecretSource")
+                .field(reference)
+                .finish(),
+            Self::ExternalSession(reference) => formatter
+                .debug_tuple("ExternalSession")
                 .field(reference)
                 .finish(),
         }
@@ -186,6 +244,7 @@ impl fmt::Debug for TransientBearerSecret {
 pub enum ResolvedProviderAuthorization {
     NoSecret,
     BearerSecret(TransientBearerSecret),
+    ExternalSession(SessionAuthorizationSourceReference),
 }
 
 impl ResolvedProviderAuthorization {
@@ -197,10 +256,14 @@ impl ResolvedProviderAuthorization {
         Self::BearerSecret(secret)
     }
 
+    pub fn external_session(reference: SessionAuthorizationSourceReference) -> Self {
+        Self::ExternalSession(reference)
+    }
+
     pub fn bearer_secret_value(&self) -> Option<&str> {
         match self {
             Self::BearerSecret(secret) => Some(secret.as_str()),
-            Self::NoSecret => None,
+            Self::NoSecret | Self::ExternalSession(_) => None,
         }
     }
 }
@@ -210,6 +273,7 @@ impl fmt::Debug for ResolvedProviderAuthorization {
         match self {
             Self::NoSecret => formatter.write_str("NoSecret"),
             Self::BearerSecret(_) => formatter.write_str("BearerSecret(<redacted>)"),
+            Self::ExternalSession(_) => formatter.write_str("ExternalSession(<redacted>)"),
         }
     }
 }
@@ -283,6 +347,7 @@ pub enum ProviderMessageRole {
 pub struct ProviderCallRequest {
     provider_name: ProviderName,
     model_name: ProviderModelName,
+    reasoning_effort: Option<ReasoningEffort>,
     authorization: ResolvedProviderAuthorization,
     messages: Vec<ProviderMessage>,
 }
@@ -291,12 +356,14 @@ impl ProviderCallRequest {
     pub fn new(
         provider_name: ProviderName,
         model_name: ProviderModelName,
+        reasoning_effort: Option<ReasoningEffort>,
         authorization: ResolvedProviderAuthorization,
         messages: Vec<ProviderMessage>,
     ) -> Self {
         Self {
             provider_name,
             model_name,
+            reasoning_effort,
             authorization,
             messages,
         }
@@ -308,6 +375,10 @@ impl ProviderCallRequest {
 
     pub fn model_name(&self) -> &ProviderModelName {
         &self.model_name
+    }
+
+    pub fn reasoning_effort(&self) -> Option<ReasoningEffort> {
+        self.reasoning_effort
     }
 
     pub fn authorization(&self) -> &ResolvedProviderAuthorization {
@@ -373,6 +444,98 @@ impl FixtureProviderClient {
 impl ProviderClient for FixtureProviderClient {
     fn call(&self, _request: ProviderCallRequest) -> Result<ProviderCallReply, Error> {
         Ok(self.reply.clone())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OpenAiCodexProviderClient {
+    command: PathBuf,
+}
+
+impl OpenAiCodexProviderClient {
+    pub fn new(command: impl Into<PathBuf>) -> Self {
+        Self {
+            command: command.into(),
+        }
+    }
+}
+
+impl ProviderClient for OpenAiCodexProviderClient {
+    fn call(&self, request: ProviderCallRequest) -> Result<ProviderCallReply, Error> {
+        OpenAiCodexInvocation::from_request(&self.command, request)?.execute()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct OpenAiCodexInvocation {
+    command: PathBuf,
+    arguments: Vec<OsString>,
+}
+
+impl OpenAiCodexInvocation {
+    fn from_request(command: &Path, request: ProviderCallRequest) -> Result<Self, Error> {
+        if request.provider_name().as_str() != "openai-codex" {
+            return Err(Error::ProviderCall(
+                "OpenAI Codex client requires provider openai-codex".to_owned(),
+            ));
+        }
+        let mut arguments = vec![
+            OsString::from("exec"),
+            OsString::from("--ephemeral"),
+            OsString::from("--skip-git-repo-check"),
+            OsString::from("--ignore-rules"),
+            OsString::from("--sandbox"),
+            OsString::from("read-only"),
+            OsString::from("--model"),
+            OsString::from(request.model_name().as_str()),
+        ];
+        if let Some(reasoning_effort) = request.reasoning_effort() {
+            arguments.push(OsString::from("--config"));
+            arguments.push(OsString::from(format!(
+                "model_reasoning_effort=\"{}\"",
+                reasoning_effort.as_str()
+            )));
+        }
+        arguments.push(OsString::from(Self::prompt_from_messages(
+            request.messages(),
+        )));
+        Ok(Self {
+            command: command.to_path_buf(),
+            arguments,
+        })
+    }
+
+    fn prompt_from_messages(messages: &[ProviderMessage]) -> String {
+        messages
+            .iter()
+            .map(|message| match message.role() {
+                ProviderMessageRole::System => format!("[system]\n{}", message.text()),
+                ProviderMessageRole::User => format!("[user]\n{}", message.text()),
+                ProviderMessageRole::Assistant => format!("[assistant]\n{}", message.text()),
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    }
+
+    fn execute(self) -> Result<ProviderCallReply, Error> {
+        let output = Command::new(&self.command)
+            .args(&self.arguments)
+            .output()
+            .map_err(|_| Error::ProviderCommand("OpenAI Codex command unavailable".to_owned()))?;
+        if !output.status.success() {
+            return Err(Error::ProviderCommand(
+                "OpenAI Codex command rejected the provider request".to_owned(),
+            ));
+        }
+        let output_text = String::from_utf8(output.stdout).map_err(|_| {
+            Error::ProviderCommand("OpenAI Codex command returned non-UTF-8 output".to_owned())
+        })?;
+        if output_text.trim().is_empty() {
+            return Err(Error::ProviderCommand(
+                "OpenAI Codex command returned empty output".to_owned(),
+            ));
+        }
+        Ok(ProviderCallReply::new(output_text, Vec::new()))
     }
 }
 
@@ -583,6 +746,7 @@ mod tests {
         let request = ProviderCallRequest::new(
             ProviderName::unchecked("fixture"),
             ProviderModelName::unchecked("fixture"),
+            None,
             ResolvedProviderAuthorization::no_secret(),
             vec![ProviderMessage::user("judge this")],
         );
@@ -590,5 +754,46 @@ mod tests {
         let reply = client.call(request).unwrap();
 
         assert_eq!(reply.output_text(), "(Accept None)");
+    }
+
+    #[test]
+    fn codex_invocation_carries_model_and_typed_reasoning_effort() {
+        let request = ProviderCallRequest::new(
+            ProviderName::unchecked("openai-codex"),
+            ProviderModelName::unchecked("gpt-5.6-terra"),
+            Some(ReasoningEffort::Medium),
+            ResolvedProviderAuthorization::external_session(
+                SessionAuthorizationSourceReference::new("codex-login").unwrap(),
+            ),
+            vec![
+                ProviderMessage::system("return a verdict"),
+                ProviderMessage::user("judge this candidate"),
+            ],
+        );
+
+        let invocation =
+            OpenAiCodexInvocation::from_request(&PathBuf::from("codex"), request).unwrap();
+        let arguments = invocation
+            .arguments
+            .iter()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            arguments,
+            vec![
+                "exec",
+                "--ephemeral",
+                "--skip-git-repo-check",
+                "--ignore-rules",
+                "--sandbox",
+                "read-only",
+                "--model",
+                "gpt-5.6-terra",
+                "--config",
+                "model_reasoning_effort=\"medium\"",
+                "[system]\nreturn a verdict\n\n[user]\njudge this candidate",
+            ]
+        );
     }
 }
