@@ -13,6 +13,7 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use nix::errno::Errno;
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 use thiserror::Error;
@@ -688,22 +689,48 @@ impl<'command> CodexChildProcess<'command> {
         let process_group = Pid::from_raw(-(child.id() as i32));
         kill(process_group, Signal::SIGTERM)
             .map_err(|_| Error::ProviderProcessGroupTeardownFailed)?;
+        self.wait_for_term_grace(child)?;
+        if self.process_group_has_members(process_group)? {
+            kill(process_group, Signal::SIGKILL)
+                .map_err(|_| Error::ProviderProcessGroupTeardownFailed)?;
+            self.wait_for_process_group_exit(process_group)?;
+        }
+        child
+            .wait()
+            .map_err(|_| Error::ProviderProcessGroupTeardownFailed)?;
+        Ok(())
+    }
+
+    fn wait_for_term_grace(&self, child: &mut std::process::Child) -> Result<(), Error> {
         let grace_deadline = Instant::now() + Duration::from_millis(100);
         while Instant::now() < grace_deadline {
-            if child
+            let _ = child
                 .try_wait()
-                .map_err(|_| Error::ProviderProcessGroupTeardownFailed)?
-                .is_some()
-            {
+                .map_err(|_| Error::ProviderProcessGroupTeardownFailed)?;
+            thread::sleep(Duration::from_millis(10));
+        }
+        Ok(())
+    }
+
+    fn process_group_has_members(&self, process_group: Pid) -> Result<bool, Error> {
+        match kill(process_group, None) {
+            Ok(()) => Ok(true),
+            Err(Errno::ESRCH) => Ok(false),
+            Err(_) => Err(Error::ProviderProcessGroupTeardownFailed),
+        }
+    }
+
+    fn wait_for_process_group_exit(&self, process_group: Pid) -> Result<(), Error> {
+        let teardown_deadline = Instant::now() + Duration::from_millis(100);
+        while Instant::now() < teardown_deadline {
+            if !self.process_group_has_members(process_group)? {
                 return Ok(());
             }
             thread::sleep(Duration::from_millis(10));
         }
-        kill(process_group, Signal::SIGKILL)
-            .map_err(|_| Error::ProviderProcessGroupTeardownFailed)?;
-        child
-            .wait()
-            .map_err(|_| Error::ProviderProcessGroupTeardownFailed)?;
+        if self.process_group_has_members(process_group)? {
+            return Err(Error::ProviderProcessGroupTeardownFailed);
+        }
         Ok(())
     }
 }
@@ -913,6 +940,7 @@ mod tests {
         command: PathBuf,
         transcript: PathBuf,
         descendant_sentinel: PathBuf,
+        descendant_process_id: PathBuf,
     }
 
     impl FakeCodex {
@@ -923,16 +951,18 @@ mod tests {
             let command = temporary.path().join("codex");
             let transcript = temporary.path().join("transcript");
             let descendant_sentinel = temporary.path().join("descendant-sentinel");
+            let descendant_process_id = temporary.path().join("descendant-process-id");
             let interpreter = if Path::new("/bin/sh").exists() {
                 "/bin/sh".to_owned()
             } else {
                 std::env::var("SHELL").unwrap_or_else(|_| "sh".to_owned())
             };
             let script = format!(
-                "#!{interpreter}\nprintf '%s\\n' \"$@\" >> '{}'\nif [ \"$1 $2\" = 'login status' ]; then exit 0; fi\ncase '{}' in\naccept) printf 'Accept\\n' ;;\nmalformed) printf 'not-a-nota-verdict\\n' ;;\nempty) : ;;\nnonutf8) printf '\\377' ;;\nnonzero) exit 9 ;;\nhang) sleep 5 ;;\ndescendant) (sleep 0.2; touch '{}') & sleep 5 ;;\nesac\n",
+                "#!{interpreter}\nprintf '%s\\n' \"$@\" >> '{}'\nif [ \"$1 $2\" = 'login status' ]; then exit 0; fi\ncase '{}' in\naccept) printf 'Accept\\n' ;;\nmalformed) printf 'not-a-nota-verdict\\n' ;;\nempty) : ;;\nnonutf8) printf '\\377' ;;\nnonzero) exit 9 ;;\nhang) sleep 5 ;;\nterm_ignoring_descendant) (trap '' TERM; sleep 0.2; touch '{}'; sleep 5) & printf '%s\\n' \"$!\" > '{}' ; sleep 5 ;;\nesac\n",
                 transcript.display(),
                 action,
-                descendant_sentinel.display()
+                descendant_sentinel.display(),
+                descendant_process_id.display()
             );
             std::fs::write(&command, script).unwrap();
             let mut permissions = std::fs::metadata(&command).unwrap().permissions();
@@ -943,6 +973,7 @@ mod tests {
                 command,
                 transcript,
                 descendant_sentinel,
+                descendant_process_id,
             }
         }
 
@@ -961,7 +992,13 @@ mod tests {
 
         fn descendant_survived(&self) -> bool {
             std::thread::sleep(Duration::from_millis(300));
+            let descendant_process_id = std::fs::read_to_string(&self.descendant_process_id)
+                .unwrap()
+                .trim()
+                .parse::<i32>()
+                .unwrap();
             self.descendant_sentinel.exists()
+                || kill(Pid::from_raw(descendant_process_id), None).is_ok()
         }
     }
 
@@ -1061,8 +1098,8 @@ mod tests {
     }
 
     #[test]
-    fn codex_timeout_terminates_the_process_group_descendant() {
-        let fake = FakeCodex::new("descendant");
+    fn codex_timeout_escalates_a_term_ignoring_process_group_descendant() {
+        let fake = FakeCodex::new("term_ignoring_descendant");
         assert_eq!(
             fake.client(25)
                 .call(CodexRequest::accepted("gpt-5.6-terra")),
