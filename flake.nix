@@ -27,7 +27,10 @@
         packages.default = craneLib.buildPackage (commonArgs // { inherit cargoArtifacts; });
         checks = {
           build = craneLib.cargoBuild (commonArgs // { inherit cargoArtifacts; });
-          test = craneLib.cargoTest (commonArgs // { inherit cargoArtifacts; });
+          test = craneLib.cargoTest (commonArgs // {
+            inherit cargoArtifacts;
+            nativeBuildInputs = [ pkgs.util-linux ];
+          });
           fmt = craneLib.cargoFmt { inherit src; };
           clippy = craneLib.cargoClippy (commonArgs // {
             inherit cargoArtifacts;

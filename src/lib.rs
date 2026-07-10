@@ -13,6 +13,8 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use nix::sys::signal::{Signal, kill};
+use nix::unistd::Pid;
 use thiserror::Error;
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -43,6 +45,9 @@ pub enum Error {
 
     #[error("provider command returned non-UTF-8 output")]
     ProviderCommandNonUtf8Output,
+
+    #[error("provider process group could not be terminated safely")]
+    ProviderProcessGroupTeardownFailed,
 
     #[error("provider authorization is not supported by this provider")]
     ProviderAuthorizationUnsupported,
@@ -483,13 +488,19 @@ const CODEX_AMBIENT_SESSION_REFERENCE: &str = "codex-login";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OpenAiCodexProviderClient {
+    session_launcher: PathBuf,
     command: PathBuf,
     timeout: ProviderCallTimeout,
 }
 
 impl OpenAiCodexProviderClient {
-    pub fn new(command: impl Into<PathBuf>, timeout: ProviderCallTimeout) -> Self {
+    pub fn new(
+        session_launcher: impl Into<PathBuf>,
+        command: impl Into<PathBuf>,
+        timeout: ProviderCallTimeout,
+    ) -> Self {
         Self {
+            session_launcher: session_launcher.into(),
             command: command.into(),
             timeout,
         }
@@ -506,6 +517,7 @@ impl OpenAiCodexProviderClient {
             return Err(Error::ProviderAuthorizationReferenceUnsupported);
         }
         let output = CodexChildProcess::new(
+            &self.session_launcher,
             &self.command,
             vec![OsString::from("login"), OsString::from("status")],
             self.timeout,
@@ -520,13 +532,23 @@ impl OpenAiCodexProviderClient {
 
 impl ProviderClient for OpenAiCodexProviderClient {
     fn call(&self, request: ProviderCallRequest) -> Result<ProviderCallReply, Error> {
+        if self.command.is_absolute() && !self.command.is_file() {
+            return Err(Error::ProviderCommandUnavailable);
+        }
         self.verify_authorization(request.authorization())?;
-        OpenAiCodexInvocation::from_request(&self.command, self.timeout, request)?.execute()
+        OpenAiCodexInvocation::from_request(
+            &self.session_launcher,
+            &self.command,
+            self.timeout,
+            request,
+        )?
+        .execute()
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct OpenAiCodexInvocation {
+    session_launcher: PathBuf,
     command: PathBuf,
     arguments: Vec<OsString>,
     timeout: ProviderCallTimeout,
@@ -534,6 +556,7 @@ struct OpenAiCodexInvocation {
 
 impl OpenAiCodexInvocation {
     fn from_request(
+        session_launcher: &Path,
         command: &Path,
         timeout: ProviderCallTimeout,
         request: ProviderCallRequest,
@@ -564,6 +587,7 @@ impl OpenAiCodexInvocation {
             request.messages(),
         )));
         Ok(Self {
+            session_launcher: session_launcher.to_path_buf(),
             command: command.to_path_buf(),
             arguments,
             timeout,
@@ -583,8 +607,13 @@ impl OpenAiCodexInvocation {
     }
 
     fn execute(self) -> Result<ProviderCallReply, Error> {
-        let output =
-            CodexChildProcess::new(&self.command, self.arguments, self.timeout).execute()?;
+        let output = CodexChildProcess::new(
+            &self.session_launcher,
+            &self.command,
+            self.arguments,
+            self.timeout,
+        )
+        .execute()?;
         if !output.status.success() {
             return Err(Error::ProviderCommandExited);
         }
@@ -598,6 +627,7 @@ impl OpenAiCodexInvocation {
 }
 
 struct CodexChildProcess<'command> {
+    session_launcher: &'command Path,
     command: &'command Path,
     arguments: Vec<OsString>,
     timeout: ProviderCallTimeout,
@@ -605,11 +635,13 @@ struct CodexChildProcess<'command> {
 
 impl<'command> CodexChildProcess<'command> {
     fn new(
+        session_launcher: &'command Path,
         command: &'command Path,
         arguments: Vec<OsString>,
         timeout: ProviderCallTimeout,
     ) -> Self {
         Self {
+            session_launcher,
             command,
             arguments,
             timeout,
@@ -623,7 +655,8 @@ impl<'command> CodexChildProcess<'command> {
         let stdout = output_file
             .reopen()
             .map_err(|_| Error::ProviderCommandUnavailable)?;
-        let mut child = Command::new(self.command)
+        let mut child = Command::new(self.session_launcher)
+            .arg(self.command)
             .args(&self.arguments)
             .stdout(Stdio::from(stdout))
             .stderr(Stdio::null())
@@ -644,12 +677,34 @@ impl<'command> CodexChildProcess<'command> {
                 });
             }
             if Instant::now() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait();
+                self.terminate_process_group(&mut child)?;
                 return Err(Error::ProviderCommandTimedOut);
             }
             thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    fn terminate_process_group(&self, child: &mut std::process::Child) -> Result<(), Error> {
+        let process_group = Pid::from_raw(-(child.id() as i32));
+        kill(process_group, Signal::SIGTERM)
+            .map_err(|_| Error::ProviderProcessGroupTeardownFailed)?;
+        let grace_deadline = Instant::now() + Duration::from_millis(100);
+        while Instant::now() < grace_deadline {
+            if child
+                .try_wait()
+                .map_err(|_| Error::ProviderProcessGroupTeardownFailed)?
+                .is_some()
+            {
+                return Ok(());
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        kill(process_group, Signal::SIGKILL)
+            .map_err(|_| Error::ProviderProcessGroupTeardownFailed)?;
+        child
+            .wait()
+            .map_err(|_| Error::ProviderProcessGroupTeardownFailed)?;
+        Ok(())
     }
 }
 
@@ -857,6 +912,7 @@ mod tests {
         temporary: tempfile::TempDir,
         command: PathBuf,
         transcript: PathBuf,
+        descendant_sentinel: PathBuf,
     }
 
     impl FakeCodex {
@@ -866,15 +922,17 @@ mod tests {
             let temporary = tempfile::TempDir::new().unwrap();
             let command = temporary.path().join("codex");
             let transcript = temporary.path().join("transcript");
+            let descendant_sentinel = temporary.path().join("descendant-sentinel");
             let interpreter = if Path::new("/bin/sh").exists() {
                 "/bin/sh".to_owned()
             } else {
                 std::env::var("SHELL").unwrap_or_else(|_| "sh".to_owned())
             };
             let script = format!(
-                "#!{interpreter}\nprintf '%s\\n' \"$@\" >> '{}'\nif [ \"$1 $2\" = 'login status' ]; then exit 0; fi\ncase '{}' in\naccept) printf 'Accept\\n' ;;\nmalformed) printf 'not-a-nota-verdict\\n' ;;\nempty) : ;;\nnonutf8) printf '\\377' ;;\nnonzero) exit 9 ;;\nhang) sleep 5 ;;\nesac\n",
+                "#!{interpreter}\nprintf '%s\\n' \"$@\" >> '{}'\nif [ \"$1 $2\" = 'login status' ]; then exit 0; fi\ncase '{}' in\naccept) printf 'Accept\\n' ;;\nmalformed) printf 'not-a-nota-verdict\\n' ;;\nempty) : ;;\nnonutf8) printf '\\377' ;;\nnonzero) exit 9 ;;\nhang) sleep 5 ;;\ndescendant) (sleep 0.2; touch '{}') & sleep 5 ;;\nesac\n",
                 transcript.display(),
-                action
+                action,
+                descendant_sentinel.display()
             );
             std::fs::write(&command, script).unwrap();
             let mut permissions = std::fs::metadata(&command).unwrap().permissions();
@@ -884,12 +942,14 @@ mod tests {
                 temporary,
                 command,
                 transcript,
+                descendant_sentinel,
             }
         }
 
         fn client(&self, timeout: u64) -> OpenAiCodexProviderClient {
             let _keep = self.temporary.path();
             OpenAiCodexProviderClient::new(
+                "setsid",
                 &self.command,
                 ProviderCallTimeout::from_milliseconds(timeout).unwrap(),
             )
@@ -897,6 +957,11 @@ mod tests {
 
         fn transcript(&self) -> String {
             std::fs::read_to_string(&self.transcript).unwrap()
+        }
+
+        fn descendant_survived(&self) -> bool {
+            std::thread::sleep(Duration::from_millis(300));
+            self.descendant_sentinel.exists()
         }
     }
 
@@ -966,6 +1031,19 @@ mod tests {
     }
 
     #[test]
+    fn codex_rejects_a_missing_executable_before_authorization() {
+        let client = OpenAiCodexProviderClient::new(
+            "setsid",
+            "/definitely-not-a-codex-executable",
+            ProviderCallTimeout::from_milliseconds(100).unwrap(),
+        );
+        assert_eq!(
+            client.call(CodexRequest::accepted("gpt-5.6-terra")),
+            Err(Error::ProviderCommandUnavailable)
+        );
+    }
+
+    #[test]
     fn codex_child_failures_are_typed_and_fail_closed() {
         for (action, expected) in [
             ("nonzero", Error::ProviderCommandExited),
@@ -980,6 +1058,17 @@ mod tests {
                 Err(expected)
             );
         }
+    }
+
+    #[test]
+    fn codex_timeout_terminates_the_process_group_descendant() {
+        let fake = FakeCodex::new("descendant");
+        assert_eq!(
+            fake.client(25)
+                .call(CodexRequest::accepted("gpt-5.6-terra")),
+            Err(Error::ProviderCommandTimedOut)
+        );
+        assert!(!fake.descendant_survived());
     }
 
     #[test]
