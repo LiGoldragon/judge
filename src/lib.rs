@@ -8,17 +8,15 @@
 
 use std::ffi::OsString;
 use std::fmt;
-use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use thiserror::Error;
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum Error {
-    #[error("retry policy requires at least one attempt")]
-    EmptyRetryPolicy,
-
     #[error("judge value is empty")]
     EmptyValue,
 
@@ -31,8 +29,26 @@ pub enum Error {
     #[error("secret source is unavailable: {0}")]
     SecretSourceUnavailable(String),
 
-    #[error("provider command failed: {0}")]
-    ProviderCommand(String),
+    #[error("provider command is unavailable")]
+    ProviderCommandUnavailable,
+
+    #[error("provider command exceeded its deadline")]
+    ProviderCommandTimedOut,
+
+    #[error("provider command exited unsuccessfully")]
+    ProviderCommandExited,
+
+    #[error("provider command returned empty output")]
+    ProviderCommandEmptyOutput,
+
+    #[error("provider command returned non-UTF-8 output")]
+    ProviderCommandNonUtf8Output,
+
+    #[error("provider authorization is not supported by this provider")]
+    ProviderAuthorizationUnsupported,
+
+    #[error("provider authorization reference is not supported")]
+    ProviderAuthorizationReferenceUnsupported,
 
     #[cfg(feature = "live-provider")]
     #[error("provider endpoint returned malformed response: {0}")]
@@ -112,6 +128,22 @@ impl ReasoningEffort {
             Self::Medium => "medium",
             Self::High => "high",
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProviderCallTimeout(Duration);
+
+impl ProviderCallTimeout {
+    pub fn from_milliseconds(milliseconds: u64) -> Result<Self, Error> {
+        if milliseconds == 0 {
+            return Err(Error::EmptyValue);
+        }
+        Ok(Self(Duration::from_millis(milliseconds)))
+    }
+
+    pub fn duration(self) -> Duration {
+        self.0
     }
 }
 
@@ -447,22 +479,49 @@ impl ProviderClient for FixtureProviderClient {
     }
 }
 
+const CODEX_AMBIENT_SESSION_REFERENCE: &str = "codex-login";
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OpenAiCodexProviderClient {
     command: PathBuf,
+    timeout: ProviderCallTimeout,
 }
 
 impl OpenAiCodexProviderClient {
-    pub fn new(command: impl Into<PathBuf>) -> Self {
+    pub fn new(command: impl Into<PathBuf>, timeout: ProviderCallTimeout) -> Self {
         Self {
             command: command.into(),
+            timeout,
         }
+    }
+
+    fn verify_authorization(
+        &self,
+        authorization: &ResolvedProviderAuthorization,
+    ) -> Result<(), Error> {
+        let ResolvedProviderAuthorization::ExternalSession(reference) = authorization else {
+            return Err(Error::ProviderAuthorizationUnsupported);
+        };
+        if reference.as_str() != CODEX_AMBIENT_SESSION_REFERENCE {
+            return Err(Error::ProviderAuthorizationReferenceUnsupported);
+        }
+        let output = CodexChildProcess::new(
+            &self.command,
+            vec![OsString::from("login"), OsString::from("status")],
+            self.timeout,
+        )
+        .execute()?;
+        if !output.status.success() {
+            return Err(Error::ProviderAuthorizationUnsupported);
+        }
+        Ok(())
     }
 }
 
 impl ProviderClient for OpenAiCodexProviderClient {
     fn call(&self, request: ProviderCallRequest) -> Result<ProviderCallReply, Error> {
-        OpenAiCodexInvocation::from_request(&self.command, request)?.execute()
+        self.verify_authorization(request.authorization())?;
+        OpenAiCodexInvocation::from_request(&self.command, self.timeout, request)?.execute()
     }
 }
 
@@ -470,10 +529,15 @@ impl ProviderClient for OpenAiCodexProviderClient {
 struct OpenAiCodexInvocation {
     command: PathBuf,
     arguments: Vec<OsString>,
+    timeout: ProviderCallTimeout,
 }
 
 impl OpenAiCodexInvocation {
-    fn from_request(command: &Path, request: ProviderCallRequest) -> Result<Self, Error> {
+    fn from_request(
+        command: &Path,
+        timeout: ProviderCallTimeout,
+        request: ProviderCallRequest,
+    ) -> Result<Self, Error> {
         if request.provider_name().as_str() != "openai-codex" {
             return Err(Error::ProviderCall(
                 "OpenAI Codex client requires provider openai-codex".to_owned(),
@@ -502,6 +566,7 @@ impl OpenAiCodexInvocation {
         Ok(Self {
             command: command.to_path_buf(),
             arguments,
+            timeout,
         })
     }
 
@@ -518,24 +583,73 @@ impl OpenAiCodexInvocation {
     }
 
     fn execute(self) -> Result<ProviderCallReply, Error> {
-        let output = Command::new(&self.command)
-            .args(&self.arguments)
-            .output()
-            .map_err(|_| Error::ProviderCommand("OpenAI Codex command unavailable".to_owned()))?;
+        let output =
+            CodexChildProcess::new(&self.command, self.arguments, self.timeout).execute()?;
         if !output.status.success() {
-            return Err(Error::ProviderCommand(
-                "OpenAI Codex command rejected the provider request".to_owned(),
-            ));
+            return Err(Error::ProviderCommandExited);
         }
-        let output_text = String::from_utf8(output.stdout).map_err(|_| {
-            Error::ProviderCommand("OpenAI Codex command returned non-UTF-8 output".to_owned())
-        })?;
+        let output_text =
+            String::from_utf8(output.stdout).map_err(|_| Error::ProviderCommandNonUtf8Output)?;
         if output_text.trim().is_empty() {
-            return Err(Error::ProviderCommand(
-                "OpenAI Codex command returned empty output".to_owned(),
-            ));
+            return Err(Error::ProviderCommandEmptyOutput);
         }
         Ok(ProviderCallReply::new(output_text, Vec::new()))
+    }
+}
+
+struct CodexChildProcess<'command> {
+    command: &'command Path,
+    arguments: Vec<OsString>,
+    timeout: ProviderCallTimeout,
+}
+
+impl<'command> CodexChildProcess<'command> {
+    fn new(
+        command: &'command Path,
+        arguments: Vec<OsString>,
+        timeout: ProviderCallTimeout,
+    ) -> Self {
+        Self {
+            command,
+            arguments,
+            timeout,
+        }
+    }
+
+    fn execute(self) -> Result<std::process::Output, Error> {
+        let output_file =
+            tempfile::NamedTempFile::new().map_err(|_| Error::ProviderCommandUnavailable)?;
+        let output_path = output_file.path().to_path_buf();
+        let stdout = output_file
+            .reopen()
+            .map_err(|_| Error::ProviderCommandUnavailable)?;
+        let mut child = Command::new(self.command)
+            .args(&self.arguments)
+            .stdout(Stdio::from(stdout))
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|_| Error::ProviderCommandUnavailable)?;
+        let deadline = Instant::now() + self.timeout.duration();
+        loop {
+            if let Some(status) = child
+                .try_wait()
+                .map_err(|_| Error::ProviderCommandUnavailable)?
+            {
+                let output =
+                    std::fs::read(&output_path).map_err(|_| Error::ProviderCommandUnavailable)?;
+                return Ok(std::process::Output {
+                    status,
+                    stdout: output,
+                    stderr: Vec::new(),
+                });
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(Error::ProviderCommandTimedOut);
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
     }
 }
 
@@ -678,23 +792,6 @@ impl JudgeDiagnostic {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RetryPolicy {
-    maximum_attempts: NonZeroUsize,
-}
-
-impl RetryPolicy {
-    pub fn new(maximum_attempts: usize) -> Result<Self, Error> {
-        let maximum_attempts =
-            NonZeroUsize::new(maximum_attempts).ok_or(Error::EmptyRetryPolicy)?;
-        Ok(Self { maximum_attempts })
-    }
-
-    pub fn maximum_attempts(&self) -> NonZeroUsize {
-        self.maximum_attempts
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FormatFailure {
     expected_shape: String,
     received_text: String,
@@ -756,44 +853,142 @@ mod tests {
         assert_eq!(reply.output_text(), "(Accept None)");
     }
 
+    struct FakeCodex {
+        temporary: tempfile::TempDir,
+        command: PathBuf,
+        transcript: PathBuf,
+    }
+
+    impl FakeCodex {
+        fn new(action: &str) -> Self {
+            use std::os::unix::fs::PermissionsExt;
+
+            let temporary = tempfile::TempDir::new().unwrap();
+            let command = temporary.path().join("codex");
+            let transcript = temporary.path().join("transcript");
+            let interpreter = if Path::new("/bin/sh").exists() {
+                "/bin/sh".to_owned()
+            } else {
+                std::env::var("SHELL").unwrap_or_else(|_| "sh".to_owned())
+            };
+            let script = format!(
+                "#!{interpreter}\nprintf '%s\\n' \"$@\" >> '{}'\nif [ \"$1 $2\" = 'login status' ]; then exit 0; fi\ncase '{}' in\naccept) printf 'Accept\\n' ;;\nmalformed) printf 'not-a-nota-verdict\\n' ;;\nempty) : ;;\nnonutf8) printf '\\377' ;;\nnonzero) exit 9 ;;\nhang) sleep 5 ;;\nesac\n",
+                transcript.display(),
+                action
+            );
+            std::fs::write(&command, script).unwrap();
+            let mut permissions = std::fs::metadata(&command).unwrap().permissions();
+            permissions.set_mode(0o700);
+            std::fs::set_permissions(&command, permissions).unwrap();
+            Self {
+                temporary,
+                command,
+                transcript,
+            }
+        }
+
+        fn client(&self, timeout: u64) -> OpenAiCodexProviderClient {
+            let _keep = self.temporary.path();
+            OpenAiCodexProviderClient::new(
+                &self.command,
+                ProviderCallTimeout::from_milliseconds(timeout).unwrap(),
+            )
+        }
+
+        fn transcript(&self) -> String {
+            std::fs::read_to_string(&self.transcript).unwrap()
+        }
+    }
+
+    struct CodexRequest;
+
+    impl CodexRequest {
+        fn accepted(model: &str) -> ProviderCallRequest {
+            ProviderCallRequest::new(
+                ProviderName::unchecked("openai-codex"),
+                ProviderModelName::unchecked(model),
+                Some(ReasoningEffort::Medium),
+                ResolvedProviderAuthorization::external_session(
+                    SessionAuthorizationSourceReference::new("codex-login").unwrap(),
+                ),
+                vec![
+                    ProviderMessage::system("return a verdict"),
+                    ProviderMessage::user("judge this candidate"),
+                ],
+            )
+        }
+    }
+
     #[test]
-    fn codex_invocation_carries_model_and_typed_reasoning_effort() {
-        let request = ProviderCallRequest::new(
-            ProviderName::unchecked("openai-codex"),
-            ProviderModelName::unchecked("gpt-5.6-terra"),
-            Some(ReasoningEffort::Medium),
-            ResolvedProviderAuthorization::external_session(
-                SessionAuthorizationSourceReference::new("codex-login").unwrap(),
-            ),
-            vec![
-                ProviderMessage::system("return a verdict"),
-                ProviderMessage::user("judge this candidate"),
-            ],
-        );
+    fn codex_invocation_carries_luna_and_terra_medium_policy() {
+        for model in ["gpt-5.6-luna", "gpt-5.6-terra"] {
+            let fake = FakeCodex::new("accept");
+            let reply = fake
+                .client(100)
+                .call(CodexRequest::accepted(model))
+                .unwrap();
 
-        let invocation =
-            OpenAiCodexInvocation::from_request(&PathBuf::from("codex"), request).unwrap();
-        let arguments = invocation
-            .arguments
-            .iter()
-            .map(|argument| argument.to_string_lossy().into_owned())
-            .collect::<Vec<_>>();
+            assert_eq!(reply.output_text(), "Accept\n");
+            let transcript = fake.transcript();
+            assert!(transcript.contains("login\nstatus\n"));
+            assert!(transcript.contains(&format!("--model\n{model}\n")));
+            assert!(transcript.contains("model_reasoning_effort=\"medium\""));
+        }
+    }
 
+    #[test]
+    fn codex_rejects_unconsumed_authorization_variants() {
+        let fake = FakeCodex::new("accept");
+        let mut request = CodexRequest::accepted("gpt-5.6-terra");
+        request.authorization = ResolvedProviderAuthorization::no_secret();
         assert_eq!(
-            arguments,
-            vec![
-                "exec",
-                "--ephemeral",
-                "--skip-git-repo-check",
-                "--ignore-rules",
-                "--sandbox",
-                "read-only",
-                "--model",
-                "gpt-5.6-terra",
-                "--config",
-                "model_reasoning_effort=\"medium\"",
-                "[system]\nreturn a verdict\n\n[user]\njudge this candidate",
-            ]
+            fake.client(100).call(request),
+            Err(Error::ProviderAuthorizationUnsupported)
         );
+
+        let mut request = CodexRequest::accepted("gpt-5.6-terra");
+        request.authorization = ResolvedProviderAuthorization::bearer_secret(
+            TransientBearerSecret::new("secret").unwrap(),
+        );
+        assert_eq!(
+            fake.client(100).call(request),
+            Err(Error::ProviderAuthorizationUnsupported)
+        );
+
+        let mut request = CodexRequest::accepted("gpt-5.6-terra");
+        request.authorization = ResolvedProviderAuthorization::external_session(
+            SessionAuthorizationSourceReference::new("other-session").unwrap(),
+        );
+        assert_eq!(
+            fake.client(100).call(request),
+            Err(Error::ProviderAuthorizationReferenceUnsupported)
+        );
+    }
+
+    #[test]
+    fn codex_child_failures_are_typed_and_fail_closed() {
+        for (action, expected) in [
+            ("nonzero", Error::ProviderCommandExited),
+            ("empty", Error::ProviderCommandEmptyOutput),
+            ("nonutf8", Error::ProviderCommandNonUtf8Output),
+            ("hang", Error::ProviderCommandTimedOut),
+        ] {
+            let fake = FakeCodex::new(action);
+            assert_eq!(
+                fake.client(25)
+                    .call(CodexRequest::accepted("gpt-5.6-terra")),
+                Err(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn codex_preserves_malformed_output_for_adapter_rejection() {
+        let fake = FakeCodex::new("malformed");
+        let reply = fake
+            .client(100)
+            .call(CodexRequest::accepted("gpt-5.6-terra"))
+            .unwrap();
+        assert_eq!(reply.output_text(), "not-a-nota-verdict\n");
     }
 }
